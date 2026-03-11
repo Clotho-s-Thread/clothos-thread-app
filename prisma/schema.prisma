@@ -1,23 +1,289 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
+// ==========================================
+// 1. 설정 (Generator & Datasource)
+// ==========================================
+// Prisma 클라이언트를 생성하고, 데이터베이스(PostgreSQL)와 연결하는 설정입니다.
 generator client {
-  provider = "prisma-client"
-  output   = "../app/generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  //url      = env("DATABASE_URL")
+  url      = "postgresql://postgres:1234@db.gocgvvvehdjxlpymwbcb.supabase.co:5432/postgres"
 }
 
+// ==========================================
+// 2. 사용자 & 인증 (NextAuth 표준)
+// ==========================================
+// 앱의 주인공인 사용자 정보를 담는 핵심 테이블입니다.
+// NextAuth(로그인 라이브러리)가 권장하는 표준 구조를 따릅니다.
 model User {
-  id        Int      @id @default(autoincrement()) // 고유 ID (기본 키)
-  email     String   @unique                      // 사용자 이메일 (중복 불가)
-  name      String?                              // 사용자 이름 (선택 사항)
-  createdAt DateTime @default(now())            // 생성 시각
-  updatedAt DateTime @updatedAt                  // 업데이트 시각
+  id            String    @id @default(cuid()) // 보안과 확장성을 위해 숫자(Int) 대신 문자열(CUID) ID 사용
+  name          String?   // 사용자 닉네임
+  email         String?   @unique // 이메일 (고유값)
+  emailVerified DateTime? // 이메일 인증 여부
+  image         String?   // 프로필 사진 URL
+  role          String    @default("user") // 권한 구분: "user"(일반), "admin"(관리자), "expert"(전문가)
+
+  // 💰 [경제] 현재 보유 포인트
+  // 매번 PointLog를 다 더해서 계산하면 느리기 때문에, 현재 잔액을 여기에 저장해둡니다.
+  point         Int       @default(0)
+
+  // 🎨 [스킨] 현재 장착 중인 카드 스킨
+  // 사용자가 설정에서 "이 스킨 쓸래"라고 선택한 스킨의 ID입니다.
+  currentSkinId Int?
+
+  // 🚫 [광고] 광고 제거 아이템 구매 여부 (New!)
+  // true면 앱에서 전면/배너 광고를 띄우지 않습니다.
+  isAdFree      Boolean   @default(false)
+
+  // --- 관계 설정 (다른 테이블들과의 연결 고리) ---
+  
+  accounts      Account[] // 소셜 로그인 계정들 (카카오, 구글 등)
+  sessions      Session[] // 현재 로그인 세션 정보
+  
+  readings      Reading[]         // 내가 본 타로 기록들
+  pointLogs     PointLog[]        // 내 포인트 적립/사용 내역 (가계부)
+  adLogs        AdRewardLog[]     // [New] 내가 광고를 보고 보상을 받은 기록
+  
+  unlockedSkins UserUnlockedSkin[] // 내가 구매해서 보유 중인 스킨 목록
+  
+  expertProfile ExpertProfile?    // 내가 전문가라면 가지고 있는 프로필 정보
+  
+  posts         Post[]            // 내가 쓴 게시글
+  comments      Comment[]         // 내가 쓴 댓글
+  likes         Like[]            // 내가 누른 좋아요
+  
+  consultationsAsClient Consultation[] // 내가 손님으로서 전문가에게 상담받은 내역
+}
+
+// 🔐 소셜 로그인 계정 정보
+// 한 명의 User가 카카오, 구글 등 여러 계정을 가질 수 있어서 따로 관리합니다.
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  type               String
+  provider           String  // 예: "kakao", "google", "naver"
+  providerAccountId  String  // 해당 소셜 서비스에서 주는 고유 ID 번호
+  refresh_token      String? @db.Text
+  access_token       String? @db.Text
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String? @db.Text
+  session_state      String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId]) // 같은 소셜 아이디는 중복될 수 없음
+}
+
+// 🌐 로그인 세션 정보
+// 로그인 상태를 유지하기 위한 토큰을 저장합니다.
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// 3. 타로 시스템 (Tarot Core)
+// ==========================================
+
+// 🃏 타로 카드 데이터 (78장 고정 정보)
+// 앱에 사용될 78장 카드의 기본 정보(이름, 기본 이미지, 해석)를 저장합니다.
+// 이 데이터는 관리자가 미리 DB에 넣어둡니다. (Seed Data)
+model TarotCard {
+  id          Int     @id @default(autoincrement())
+  number      Int     @unique // 0번(바보) ~ 77번(킹 펜타클)
+  name        String  // 영어 이름 (예: "The Fool")
+  nameKo      String? // 한글 이름 (예: "바보")
+  imageUrl    String  // 카드의 기본 이미지 주소
+  meaningUp   String? @db.Text // 정방향일 때의 기본 의미
+  meaningRev  String? @db.Text // 역방향일 때의 기본 의미
+
+  readings    ReadingCard[] // 이 카드가 몇 번이나 뽑혔는지 기록됨
+}
+
+// 🔮 타로 점 본 결과 (Reading)
+// 사용자가 한 번 점을 볼 때마다 생성되는 "결과지"입니다.
+model Reading {
+  id           String   @id @default(cuid()) // 친구에게 공유할 때 URL에 쓰기 위해 String ID 사용
+  createdAt    DateTime @default(now()) // 언제 점을 봤는지
+  
+  // 사용자 입력 데이터
+  question     String   @db.Text // 사용자가 입력한 고민/질문 내용
+  spreadType   String   // 점 보는 방식 ("one-card", "three-card" 등)
+  
+  // AI 분석 데이터
+  fullAnswer   String   @db.Text // AI 타로 마스터가 해준 전체 해석
+  summary      String?  @db.Text // (선택) 3줄 요약
+
+  // 누구의 점괘인가?
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // 이 판에서 뽑힌 카드들 (1:N 관계)
+  cards        ReadingCard[]
+}
+
+// 🎴 점(Reading)과 카드(TarotCard)의 연결고리
+// "A라는 점괘에서, 첫 번째로, 바보 카드가, 역방향으로 나왔다"는 정보를 저장합니다.
+model ReadingCard {
+  id           Int       @id @default(autoincrement())
+  
+  readingId    String    // 어느 점괘 소속인지
+  reading      Reading   @relation(fields: [readingId], references: [id], onDelete: Cascade)
+  
+  cardId       Int       // 무슨 카드인지
+  card         TarotCard @relation(fields: [cardId], references: [id])
+  
+  // 뽑힌 상세 상태
+  position     Int       // 카드 위치 (1:과거, 2:현재, 3:미래 등)
+  orientation  String    // 카드 방향 ("upright":정방향, "reversed":역방향)
+}
+
+// ==========================================
+// 4. 스킨 & 해금 시스템 (Unlock System)
+// ==========================================
+
+// 🛒 상점 상품 (카드 스킨)
+// 사용자가 구매할 수 있는 카드 뒷면/앞면 디자인 상품입니다.
+model CardSkin {
+  id          Int      @id @default(autoincrement())
+  name        String   // 스킨 이름 (예: "다크 판타지 에디션")
+  frontUrl    String   // 앞면 디자인 이미지
+  backUrl     String   // 뒷면 디자인 이미지 (타로 볼 때 가장 많이 보는 부분)
+  price       Int      // 가격 (코인)
+  isDefault   Boolean  @default(false) // 기본으로 주는 무료 스킨인지 여부
+
+  owners      UserUnlockedSkin[] // 이 스킨을 가진 사람들 목록
+}
+
+// 🎒 사용자 보유 스킨 (인벤토리)
+// "누가(User) 어떤 스킨(CardSkin)을 샀다"는 영수증 같은 테이블입니다.
+model UserUnlockedSkin {
+  id          Int      @id @default(autoincrement())
+  obtainedAt  DateTime @default(now()) // 언제 획득했는지
+  
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  skinId      Int
+  skin        CardSkin @relation(fields: [skinId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, skinId]) // 한 사람이 같은 스킨을 두 번 살 순 없음 (중복 방지)
+}
+
+// ==========================================
+// 5. 전문가 매칭 시스템 (Expert System)
+// ==========================================
+
+// 🧙‍♂️ 전문가 프로필
+// 일반 User 중에서 "전문가(Expert)" 권한을 가진 사람의 추가 정보입니다.
+model ExpertProfile {
+  id           Int      @id @default(autoincrement())
+  
+  userId       String   @unique // User 테이블과 1:1로 연결됨
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  nickname     String   // 전문가로서 활동하는 이름 (예: "천리안")
+  intro        String   @db.Text // 자기소개 글
+  specialty    String   // 전문 분야 (예: "재회운, 금전운")
+  pricePerChat Int      // 1회 상담 가격
+  rating       Float    @default(0.0) // 평균 평점
+  reviewCount  Int      @default(0)   // 받은 리뷰 개수
+  
+  consultations Consultation[] // 진행한 상담 내역들
+}
+
+// 🤝 상담 내역 (매칭 기록)
+// 고객과 전문가 사이의 거래 기록입니다.
+model Consultation {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+  status       String   // 상담 상태 ("pending":대기, "active":상담중, "completed":종료, "canceled":취소)
+  
+  // 고객 (상담을 요청한 사람)
+  clientId     String
+  client       User     @relation(fields: [clientId], references: [id])
+  
+  // 전문가 (상담을 해주는 사람)
+  expertId     Int
+  expert       ExpertProfile @relation(fields: [expertId], references: [id])
+  
+  // (추후 확장 시 채팅 로그 ID 등을 여기에 추가할 수 있음)
+}
+
+// ==========================================
+// 6. 경제 & 커뮤니티 & 광고 (Economy & Community & Ads)
+// ==========================================
+
+// 📒 포인트 장부 (PointLog)
+// 코인이 들어오고 나간 모든 내역을 기록하여 분쟁을 방지합니다.
+model PointLog {
+  id           Int      @id @default(autoincrement())
+  amount       Int      // 변동 금액 (+100, -500 등)
+  reason       String   // 사유 ("스킨구매", "출석체크", "충전", "광고보상")
+  createdAt    DateTime @default(now())
+  
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// 📺 [New] 광고 시청 기록 (AdRewardLog)
+// 사용자가 보상형 광고를 보고 코인을 받아간 기록입니다.
+// "하루 5회 제한" 같은 기능을 구현하기 위해 필수입니다.
+model AdRewardLog {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now()) // 언제 봤는지 (날짜 체크용)
+  
+  platform    String   // 광고 플랫폼 ("admob", "unity" 등 - 나중에 통계 낼 때 유용)
+  reward      Int      // 지급받은 보상 (예: 30코인)
+  
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// 📝 게시글 (Community Post)
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String   // 제목
+  content   String   @db.Text // 내용
+  viewCount Int      @default(0) // 조회수
+  createdAt DateTime @default(now())
+  
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  comments  Comment[]
+  likes     Like[]
+}
+
+// 💬 댓글 (Comment)
+model Comment {
+  id        Int      @id @default(autoincrement())
+  content   String   // 댓글 내용
+  createdAt DateTime @default(now())
+  
+  postId    Int
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ❤️ 좋아요 (Like)
+model Like {
+  id        Int      @id @default(autoincrement())
+  
+  postId    Int
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, postId]) // 한 사람이 같은 글에 좋아요를 두 번 누를 수 없음
 }
